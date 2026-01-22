@@ -357,28 +357,38 @@ class KernelBuilder:
             if round_idx == 0:
                 # First round: full prologue for batch 0
                 emit_load_phase_sequential(buf_0, 0)
-            else:
-                # Later rounds: addr_ALU + vload done in prev epilogue, just do ga_ALU
-                ga_ops_0 = build_ga_alu_ops(buf_0)
-                for ops in ga_ops_0:
-                    self.instrs.append(self.build_vliw(ops))
+            # else: addr[0] + vload[0] + ga_ALU[0] + addr[1] + vload[1] all done in prev epilogue
 
-            # gather[0] + early addr_ALU[1]
+            # gather[0] + addr_ALU[1] (round 0) OR gather[0] + ga_ALU[1] (rounds > 0)
             gather_ops_0 = build_gather_ops(buf_0)
-            addr_ops_1 = build_addr_alu_ops(buf_1, 1)
-            for i, cycle_ops in enumerate(gather_ops_0):
-                bundle = list(cycle_ops)
-                if i < len(addr_ops_1):
-                    bundle.extend(addr_ops_1[i])
-                self.instrs.append(self.build_vliw(bundle))
+            if round_idx == 0:
+                addr_ops_1 = build_addr_alu_ops(buf_1, 1)
+                for i, cycle_ops in enumerate(gather_ops_0):
+                    bundle = list(cycle_ops)
+                    if i < len(addr_ops_1):
+                        bundle.extend(addr_ops_1[i])
+                    self.instrs.append(self.build_vliw(bundle))
+            else:
+                # Overlap ga_ALU[1] with gather[0] (vload[1] done in epilogue, ga needs those indices)
+                ga_ops_1 = build_ga_alu_ops(buf_1)
+                ga1_idx = 0
+                for cycle_ops in gather_ops_0:
+                    bundle = list(cycle_ops)
+                    if ga1_idx < len(ga_ops_1):
+                        bundle.extend(ga_ops_1[ga1_idx])
+                        ga1_idx += 1
+                    self.instrs.append(self.build_vliw(bundle))
 
-            # Prologue 2: skip addr_ALU[1] (done above), do vload[1], ga_ALU[1]
-            vload_ops_1 = build_vload_ops(buf_1)
-            for ops in vload_ops_1:
-                self.instrs.append(self.build_vliw(ops))
-            ga_ops_1 = build_ga_alu_ops(buf_1)
-            for ops in ga_ops_1:
-                self.instrs.append(self.build_vliw(ops))
+            # Prologue 2: vload[1] and ga_ALU[1] (only for round 0)
+            if round_idx == 0:
+                # Round 0: do both vload[1] and ga_ALU[1]
+                vload_ops_1 = build_vload_ops(buf_1)
+                for ops in vload_ops_1:
+                    self.instrs.append(self.build_vliw(ops))
+                ga_ops_1 = build_ga_alu_ops(buf_1)
+                for ops in ga_ops_1:
+                    self.instrs.append(self.build_vliw(ops))
+            # else: vload[1] done in epilogue, ga_ALU[1] overlapped with gather[0] above
 
             # gather[1] + valu[0] + early addr_ALU[2]
             gather_ops_1 = build_gather_ops(buf_1)
@@ -410,37 +420,14 @@ class KernelBuilder:
                 valu_ops = build_valu_ops(prev_buf)
                 v_idx = 0
 
-                if batch_idx > 2:
-                    # Overlap addr_ALU[i] + valu[i-1], then vload[i] + valu[i-1]
-                    # Stagger: cycle 0 = addr[g0-5]+valu, cycle 1 = addr[g6-7]+vload[g0]+valu
-                    addr_ops = build_addr_alu_ops(cur_buf, batch_idx)
-                    # Cycle 0: addr[g0-5] + valu
-                    bundle = list(addr_ops[0])
+                # addr_ALU[i] was done in previous batch's gather phase (or prologue for batch 2)
+                # Just do vload + valu
+                for vl_ops in vload_ops:
+                    bundle = list(vl_ops)
                     if v_idx < len(valu_ops):
                         bundle.extend(valu_ops[v_idx])
                         v_idx += 1
                     self.instrs.append(self.build_vliw(bundle))
-                    # Cycle 1: addr[g6-7] + vload[g0] + valu
-                    bundle = list(addr_ops[1]) + list(vload_ops[0])
-                    if v_idx < len(valu_ops):
-                        bundle.extend(valu_ops[v_idx])
-                        v_idx += 1
-                    self.instrs.append(self.build_vliw(bundle))
-                    # Cycles 2-8: vload[g1-7] + valu
-                    for vl_ops in vload_ops[1:]:
-                        bundle = list(vl_ops)
-                        if v_idx < len(valu_ops):
-                            bundle.extend(valu_ops[v_idx])
-                            v_idx += 1
-                        self.instrs.append(self.build_vliw(bundle))
-                else:
-                    # Batch 2: addr_ALU[2] already done, just vload + valu
-                    for vl_ops in vload_ops:
-                        bundle = list(vl_ops)
-                        if v_idx < len(valu_ops):
-                            bundle.extend(valu_ops[v_idx])
-                            v_idx += 1
-                        self.instrs.append(self.build_vliw(bundle))
 
                 # Phase 2: ga_ALU[i] + valu[i-1] continuing - 6 cycles
                 ga_ops = build_ga_alu_ops(cur_buf)
@@ -451,10 +438,15 @@ class KernelBuilder:
                         v_idx += 1
                     self.instrs.append(self.build_vliw(bundle))
 
-                # Phase 3: gather[i] + valu[i-1] remaining + store[i-2]
+                # Phase 3: gather[i] + valu[i-1] remaining + store[i-2] + addr_ALU[i+1]
                 gather_ops = build_gather_ops(cur_buf)
                 store_ops = build_store_ops(prev_prev_buf)
-                g_idx, s_idx = 0, 0
+                # Overlap addr_ALU for NEXT batch during this gather phase
+                next_addr_ops = []
+                if batch_idx + 1 < n_batches:
+                    next_buf = get_buf(batch_idx + 1, round_idx)
+                    next_addr_ops = build_addr_alu_ops(next_buf, batch_idx + 1)
+                g_idx, s_idx, a_idx = 0, 0, 0
                 while g_idx < len(gather_ops) or v_idx < len(valu_ops) or s_idx < len(store_ops):
                     bundle = []
                     if g_idx < len(gather_ops):
@@ -466,6 +458,9 @@ class KernelBuilder:
                     if s_idx < len(store_ops):
                         bundle.extend(store_ops[s_idx])
                         s_idx += 1
+                    if a_idx < len(next_addr_ops):
+                        bundle.extend(next_addr_ops[a_idx])
+                        a_idx += 1
                     self.instrs.append(self.build_vliw(bundle))
 
             # Epilogue 1: valu[n_batches-1] + store[n_batches-2]
@@ -488,24 +483,42 @@ class KernelBuilder:
             store_ops = build_store_ops(last_buf)
             if round_idx < rounds - 1:
                 # Cross-round overlap: store uses buf[(3+R)%3], next round uses buf[(R+1)%3]
-                # These are different, so we can overlap!
                 next_buf_0 = get_buf(0, round_idx + 1)
-                next_addr_ops = build_addr_alu_ops(next_buf_0, 0)
-                next_vload_ops = build_vload_ops(next_buf_0)
+                next_buf_1 = get_buf(1, round_idx + 1)
+                next_addr_ops_0 = build_addr_alu_ops(next_buf_0, 0)
+                next_addr_ops_1 = build_addr_alu_ops(next_buf_1, 1)
+                next_vload_ops_0 = build_vload_ops(next_buf_0)
+                next_vload_ops_1 = build_vload_ops(next_buf_1)
+                next_ga_ops_0 = build_ga_alu_ops(next_buf_0)
 
-                # Optimized interleave: start vload[g0] in cycle 2 (after addr[g0-5] in cycle 1)
-                # Cycle 1: store + addr[g0-5]
-                bundle = list(store_ops[0]) + list(next_addr_ops[0])
+                # Cycles 1-2: store + addr[0] + vload[0] starts
+                bundle = list(store_ops[0]) + list(next_addr_ops_0[0])
                 self.instrs.append(self.build_vliw(bundle))
-                # Cycle 2: store + addr[g6-7] + vload[g0]
-                bundle = list(store_ops[1]) + list(next_addr_ops[1]) + list(next_vload_ops[0])
+                bundle = list(store_ops[1]) + list(next_addr_ops_0[1]) + list(next_vload_ops_0[0])
                 self.instrs.append(self.build_vliw(bundle))
-                # Cycles 3-8: store + vload[g1-6]
+                # Cycles 3-8: store + vload[0] + addr[1]
+                a1_idx = 0
                 for i in range(2, 8):
-                    bundle = list(store_ops[i]) + list(next_vload_ops[i - 1])
+                    bundle = list(store_ops[i]) + list(next_vload_ops_0[i - 1])
+                    if a1_idx < len(next_addr_ops_1):
+                        bundle.extend(next_addr_ops_1[a1_idx])
+                        a1_idx += 1
                     self.instrs.append(self.build_vliw(bundle))
-                # Cycle 9: vload[g7] (store finished)
-                self.instrs.append(self.build_vliw(next_vload_ops[7]))
+                # Cycle 9: vload[0, g7]
+                self.instrs.append(self.build_vliw(next_vload_ops_0[7]))
+                # Cycles 10-17: ga_ALU[0] + vload[1] (overlapped: ALU vs load!)
+                ga0_idx = 0
+                for vl_idx, vl_ops in enumerate(next_vload_ops_1):
+                    bundle = list(vl_ops)
+                    if ga0_idx < len(next_ga_ops_0):
+                        bundle.extend(next_ga_ops_0[ga0_idx])
+                        ga0_idx += 1
+                    self.instrs.append(self.build_vliw(bundle))
+                # Remaining ga_ALU[0] if any (shouldn't be, vload=8, ga=6)
+                while ga0_idx < len(next_ga_ops_0):
+                    self.instrs.append(self.build_vliw(next_ga_ops_0[ga0_idx]))
+                    ga0_idx += 1
+                # ga_ALU[1] will be overlapped with gather[0] in round start
             else:
                 # Last round - just store
                 for cycle_ops in store_ops:
