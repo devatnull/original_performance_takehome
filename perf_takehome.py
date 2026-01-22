@@ -93,25 +93,89 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized VLIW+SIMD implementation.
-        Process VLEN (8) elements at once using vector operations.
-        Pack independent operations into same instruction bundle.
+        Optimized VLIW+SIMD implementation with PERSISTENT SCRATCH.
+
+        Key optimization: Keep idx and val in scratch across all rounds.
+        Only vload once at start, vstore once at end.
+        This eliminates ~960 cycles of per-batch vload/vstore overhead!
         """
         # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
 
+        n_groups_total = batch_size // VLEN  # 32
+        BATCH_SIZE = 8  # Process 8 groups at a time
+        n_batches = n_groups_total // BATCH_SIZE  # 4 batches per round
+
         # Initialize memory layout variables
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
             "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
+        # Allocate scratch for init_vars
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+
+        # Allocate scratch for basic constants
+        zero_const = self.alloc_scratch("const_0")
+        one_const = self.alloc_scratch("const_1")
+        two_const = self.alloc_scratch("const_2")
+        self.const_map[0] = zero_const
+        self.const_map[1] = one_const
+        self.const_map[2] = two_const
+
+        # Allocate scratch for hash constants
+        hash_scalar_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.alloc_scratch(f"hash_{hi}_c1")
+            c3 = self.alloc_scratch(f"hash_{hi}_c3")
+            self.const_map[val1] = c1
+            self.const_map[val3] = c3
+            hash_scalar_consts.append((c1, c3))
+
+        # Allocate scratch for group offset constants
+        all_g_consts = []
+        for g in range(n_groups_total):
+            addr = self.alloc_scratch(f"g_const_{g}")
+            self.const_map[g * VLEN] = addr
+            all_g_consts.append(addr)
+
+        # ============================================================
+        # BATCHED INITIALIZATION: Load all constants with VLIW (2 per cycle)
+        # ============================================================
+        idx_consts = [self.alloc_scratch(f"idx_{i}") for i in range(len(init_vars))]
+
+        # Collect ALL const loads needed
+        const_loads = []
+        const_loads.append(("load", ("const", zero_const, 0)))
+        const_loads.append(("load", ("const", one_const, 1)))
+        const_loads.append(("load", ("const", two_const, 2)))
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1, c3 = hash_scalar_consts[hi]
+            const_loads.append(("load", ("const", c1, val1)))
+            const_loads.append(("load", ("const", c3, val3)))
+        for g in range(n_groups_total):
+            const_loads.append(("load", ("const", all_g_consts[g], g * VLEN)))
+        for i in range(len(init_vars)):
+            const_loads.append(("load", ("const", idx_consts[i], i)))
+
+        # Batch const loads 2 per cycle (load engine has 2 slots)
+        for i in range(0, len(const_loads), 2):
+            if i + 1 < len(const_loads):
+                self.instrs.append(self.build_vliw([const_loads[i], const_loads[i+1]]))
+            else:
+                self.instrs.append(self.build_vliw([const_loads[i]]))
+
+        # Load all memory values (batched)
+        mem_loads = [("load", ("load", self.scratch[init_vars[i]], idx_consts[i])) for i in range(len(init_vars))]
+        for i in range(0, len(mem_loads), 2):
+            if i + 1 < len(mem_loads):
+                self.instrs.append(self.build_vliw([mem_loads[i], mem_loads[i+1]]))
+            else:
+                self.instrs.append(self.build_vliw([mem_loads[i]]))
+
+        self.add("flow", ("pause",))
 
         # Constants
         zero_const = self.scratch_const(0)
@@ -120,13 +184,7 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # Vector temporaries (VLEN = 8 elements each)
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        # Vector constants
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
@@ -140,389 +198,385 @@ class KernelBuilder:
             ("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])),
         ]))
 
-        # Precompute hash stage constants as vectors
+        # Precompute hash stage constants as vectors (batch 6 vbroadcasts per cycle)
         v_hash_consts = []
+        vbroadcast_ops = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_const1 = self.alloc_scratch(f"v_hash_{hi}_c1", VLEN)
             v_const3 = self.alloc_scratch(f"v_hash_{hi}_c3", VLEN)
-            c1_scalar = self.scratch_const(val1)
-            c3_scalar = self.scratch_const(val3)
-            self.instrs.append(self.build_vliw([
-                ("valu", ("vbroadcast", v_const1, c1_scalar)),
-                ("valu", ("vbroadcast", v_const3, c3_scalar)),
-            ]))
+            c1_scalar, c3_scalar = hash_scalar_consts[hi]
+            vbroadcast_ops.append(("valu", ("vbroadcast", v_const1, c1_scalar)))
+            vbroadcast_ops.append(("valu", ("vbroadcast", v_const3, c3_scalar)))
             v_hash_consts.append((v_const1, v_const3))
 
-        # Process groups with pipelining across batches
-        n_groups_total = batch_size // VLEN  # 32
-        BATCH_SIZE = 8  # Process 8 groups at a time (scratch-constrained)
-        n_batches = n_groups_total // BATCH_SIZE  # 4 batches per round
+        for i in range(0, len(vbroadcast_ops), 6):
+            self.instrs.append(self.build_vliw(vbroadcast_ops[i:i+6]))
 
-        # Shared temporaries for valu (only one valu active at a time)
-        shared_tmp1 = [self.alloc_scratch(f"shared_tmp1_{g}", VLEN) for g in range(BATCH_SIZE)]
-        shared_tmp2 = [self.alloc_scratch(f"shared_tmp2_{g}", VLEN) for g in range(BATCH_SIZE)]
+        # ============================================================
+        # PERSISTENT SCRATCH: Allocate ALL idx/val for entire dataset
+        # These stay in scratch across ALL rounds!
+        # ============================================================
+        persistent_idx = [self.alloc_scratch(f"p_idx_{g}", VLEN) for g in range(n_groups_total)]
+        persistent_val = [self.alloc_scratch(f"p_val_{g}", VLEN) for g in range(n_groups_total)]
 
-        # Allocate FOUR buffers - eliminates aliasing conflicts!
-        # With 4 buffers for 4 batches: no intra-round conflicts
-        # With round-offset indexing: no cross-round conflicts either
-        def alloc_batch_scratch(prefix):
+        # Working buffers for batch processing (2 buffers for pipelining)
+        def alloc_work_buffer(prefix):
             return {
-                'addr_idx': [self.alloc_scratch(f"{prefix}_{g}_addr_idx") for g in range(BATCH_SIZE)],
-                'addr_val': [self.alloc_scratch(f"{prefix}_{g}_addr_val") for g in range(BATCH_SIZE)],
                 'ga': [[self.alloc_scratch(f"{prefix}_{g}_ga_{i}") for i in range(VLEN)] for g in range(BATCH_SIZE)],
-                'idx': [self.alloc_scratch(f"{prefix}_{g}_idx", VLEN) for g in range(BATCH_SIZE)],
-                'val': [self.alloc_scratch(f"{prefix}_{g}_val", VLEN) for g in range(BATCH_SIZE)],
                 'node': [self.alloc_scratch(f"{prefix}_{g}_node", VLEN) for g in range(BATCH_SIZE)],
-                'tmp1': shared_tmp1,  # Shared!
-                'tmp2': shared_tmp2,  # Shared!
+                'tmp1': [self.alloc_scratch(f"{prefix}_{g}_tmp1", VLEN) for g in range(BATCH_SIZE)],
+                'tmp2': [self.alloc_scratch(f"{prefix}_{g}_tmp2", VLEN) for g in range(BATCH_SIZE)],
             }
 
-        # 4 buffers: no aliasing within a round, enables deeper pipelining
-        buf = [alloc_batch_scratch("A"), alloc_batch_scratch("B"),
-               alloc_batch_scratch("C"), alloc_batch_scratch("D")]
+        work_buf = [alloc_work_buffer("W0"), alloc_work_buffer("W1")]
 
-        def build_valu_ops(b):
-            """Build VALU ops for batch b with modulo-scheduled hash for better pipelining"""
+        # Memory address constants (computed once)
+        addr_idx_base = [self.alloc_scratch(f"addr_idx_{g}") for g in range(n_groups_total)]
+        addr_val_base = [self.alloc_scratch(f"addr_val_{g}") for g in range(n_groups_total)]
+
+        # Group offset constants for batch processing
+        batch_g_consts = []
+        for batch_idx in range(n_batches):
+            base_group = batch_idx * BATCH_SIZE
+            batch_g_consts.append([all_g_consts[base_group + g] for g in range(BATCH_SIZE)])
+
+        # ============================================================
+        # HELPER FUNCTIONS for persistent scratch approach
+        # ============================================================
+
+        def get_persistent_idx(g):
+            """Get persistent idx scratch for global group g"""
+            return persistent_idx[g]
+
+        def get_persistent_val(g):
+            """Get persistent val scratch for global group g"""
+            return persistent_val[g]
+
+        def build_valu_ops_persistent(work, batch_idx):
+            """Build VALU ops for batch using persistent idx/val storage"""
             ops_list = []
+            base_g = batch_idx * BATCH_SIZE  # Global group offset
 
-            # MODULO-SCHEDULED HASH with XOR overlap
+            # Get references to persistent storage for this batch
+            p_val = [get_persistent_val(base_g + g) for g in range(BATCH_SIZE)]
+            p_idx = [get_persistent_idx(base_g + g) for g in range(BATCH_SIZE)]
+
             def tmp_ops(hi, groups):
-                """Generate tmp1, tmp2 ops for given hash stage and groups"""
+                """Generate tmp1, tmp2 ops for hash stage"""
                 v_c1, v_c3 = v_hash_consts[hi]
                 ops = []
                 for g in groups:
-                    ops.append(("valu", (HASH_STAGES[hi][0], b['tmp1'][g], b['val'][g], v_c1)))
-                    ops.append(("valu", (HASH_STAGES[hi][3], b['tmp2'][g], b['val'][g], v_c3)))
+                    ops.append(("valu", (HASH_STAGES[hi][0], work['tmp1'][g], p_val[g], v_c1)))
+                    ops.append(("valu", (HASH_STAGES[hi][3], work['tmp2'][g], p_val[g], v_c3)))
                 return ops
 
             def combine_ops(hi, groups):
-                """Generate combine ops for given hash stage and groups"""
-                return [("valu", (HASH_STAGES[hi][2], b['val'][g], b['tmp1'][g], b['tmp2'][g]))
+                """Generate combine ops for hash stage"""
+                return [("valu", (HASH_STAGES[hi][2], p_val[g], work['tmp1'][g], work['tmp2'][g]))
                         for g in groups]
 
-            # XOR for g0-5, then XOR g6-7 + hash stage 0 tmp g0-1
-            ops_list.append([("valu", ("^", b['val'][g], b['val'][g], b['node'][g])) for g in range(6)])
-            xor_67 = [("valu", ("^", b['val'][g], b['val'][g], b['node'][g])) for g in [6, 7]]
-            ops_list.append(xor_67 + tmp_ops(0, [0, 1]))  # 2 + 4 = 6 ops
+            # XOR with gathered node values
+            ops_list.append([("valu", ("^", p_val[g], p_val[g], work['node'][g])) for g in range(6)])
+            xor_67 = [("valu", ("^", p_val[g], p_val[g], work['node'][g])) for g in [6, 7]]
+            ops_list.append(xor_67 + tmp_ops(0, [0, 1]))
 
-            # Stage 0 tmp for remaining groups (2 cycles)
-            ops_list.append(tmp_ops(0, [2, 3, 4]))  # 6 ops
-            ops_list.append(tmp_ops(0, [5, 6, 7]))  # 6 ops
+            ops_list.append(tmp_ops(0, [2, 3, 4]))
+            ops_list.append(tmp_ops(0, [5, 6, 7]))
 
-            # Pipelined stages 1-5: overlap combine[hi-1] with tmp[hi]
             for hi in range(1, 6):
-                # g0-5 combine from prev stage (6 ops)
                 ops_list.append(combine_ops(hi-1, [0, 1, 2, 3, 4, 5]))
-                # g6-7 combine prev (2 ops) + g0-1 tmp cur (4 ops) = 6 ops
                 ops_list.append(combine_ops(hi-1, [6, 7]) + tmp_ops(hi, [0, 1]))
-                # g2-4 tmp cur (6 ops)
                 ops_list.append(tmp_ops(hi, [2, 3, 4]))
-                # g5-7 tmp cur (6 ops)
                 ops_list.append(tmp_ops(hi, [5, 6, 7]))
 
-            # Epilogue + Index: Aggressive overlap of under-utilized cycles
-            # Cycle 1: g0-5 combine stage 5 (6 ops)
+            # Epilogue: final combine + index calculation
             ops_list.append(combine_ops(5, [0, 1, 2, 3, 4, 5]))
-            # Cycle 2: g6-7 combine (2) + g0-1 & + multiply_add (4) = 6 ops
             idx_ops_01 = []
             for g in [0, 1]:
-                idx_ops_01.append(("valu", ("&", b['tmp1'][g], b['val'][g], v_one)))
-                idx_ops_01.append(("valu", ("multiply_add", b['idx'][g], b['idx'][g], v_two, v_one)))
+                idx_ops_01.append(("valu", ("&", work['tmp1'][g], p_val[g], v_one)))
+                idx_ops_01.append(("valu", ("multiply_add", p_idx[g], p_idx[g], v_two, v_one)))
             ops_list.append(combine_ops(5, [6, 7]) + idx_ops_01)
-            # Cycle 3: g2-4 & + multiply_add (6 ops)
+
             idx_ops_24 = []
             for g in [2, 3, 4]:
-                idx_ops_24.append(("valu", ("&", b['tmp1'][g], b['val'][g], v_one)))
-                idx_ops_24.append(("valu", ("multiply_add", b['idx'][g], b['idx'][g], v_two, v_one)))
+                idx_ops_24.append(("valu", ("&", work['tmp1'][g], p_val[g], v_one)))
+                idx_ops_24.append(("valu", ("multiply_add", p_idx[g], p_idx[g], v_two, v_one)))
             ops_list.append(idx_ops_24)
-            # Cycle 4: g5-7 & + multiply_add (6 ops)
+
             idx_ops_57 = []
             for g in [5, 6, 7]:
-                idx_ops_57.append(("valu", ("&", b['tmp1'][g], b['val'][g], v_one)))
-                idx_ops_57.append(("valu", ("multiply_add", b['idx'][g], b['idx'][g], v_two, v_one)))
+                idx_ops_57.append(("valu", ("&", work['tmp1'][g], p_val[g], v_one)))
+                idx_ops_57.append(("valu", ("multiply_add", p_idx[g], p_idx[g], v_two, v_one)))
             ops_list.append(idx_ops_57)
-            # Cycle 5: add g0-5 (6 ops)
-            ops_list.append([("valu", ("+", b['idx'][g], b['idx'][g], b['tmp1'][g])) for g in range(6)])
-            # Cycle 6: add g6-7 (2) + bounds g0-3 (4) = 6 ops
-            add_67 = [("valu", ("+", b['idx'][g], b['idx'][g], b['tmp1'][g])) for g in [6, 7]]
-            bounds_03 = [("valu", ("<", b['tmp1'][g], b['idx'][g], v_n_nodes)) for g in range(4)]
+
+            ops_list.append([("valu", ("+", p_idx[g], p_idx[g], work['tmp1'][g])) for g in range(6)])
+            add_67 = [("valu", ("+", p_idx[g], p_idx[g], work['tmp1'][g])) for g in [6, 7]]
+            bounds_03 = [("valu", ("<", work['tmp1'][g], p_idx[g], v_n_nodes)) for g in range(4)]
             ops_list.append(add_67 + bounds_03)
-            # Cycle 7: bounds g4-7 (4) + multiply_mask g0-1 (2) = 6 ops
-            bounds_47 = [("valu", ("<", b['tmp1'][g], b['idx'][g], v_n_nodes)) for g in [4, 5, 6, 7]]
-            mask_01 = [("valu", ("*", b['idx'][g], b['idx'][g], b['tmp1'][g])) for g in [0, 1]]
+
+            bounds_47 = [("valu", ("<", work['tmp1'][g], p_idx[g], v_n_nodes)) for g in [4, 5, 6, 7]]
+            mask_01 = [("valu", ("*", p_idx[g], p_idx[g], work['tmp1'][g])) for g in [0, 1]]
             ops_list.append(bounds_47 + mask_01)
-            # Cycle 8: multiply_mask g2-7 (6 ops)
-            ops_list.append([("valu", ("*", b['idx'][g], b['idx'][g], b['tmp1'][g])) for g in range(2, 8)])
+            ops_list.append([("valu", ("*", p_idx[g], p_idx[g], work['tmp1'][g])) for g in range(2, 8)])
             return ops_list
 
-        def build_gather_ops(b):
-            """Build gather ops for batch b, 2 loads per cycle"""
+        def build_gather_ops_persistent(work, batch_idx):
+            """Build gather ops using work buffer"""
             ops_list = []
             for g in range(BATCH_SIZE):
                 for i in range(0, VLEN, 2):
                     ops_list.append([
-                        ("load", ("load", b['node'][g] + i, b['ga'][g][i])),
-                        ("load", ("load", b['node'][g] + i + 1, b['ga'][g][i + 1])),
+                        ("load", ("load", work['node'][g] + i, work['ga'][g][i])),
+                        ("load", ("load", work['node'][g] + i + 1, work['ga'][g][i + 1])),
                     ])
             return ops_list
 
-        # Precompute group offset constants for all batches
-        batch_g_consts = []
-        for batch_idx in range(n_batches):
-            base_group = batch_idx * BATCH_SIZE
-            batch_g_consts.append([self.scratch_const((base_group + g) * VLEN) for g in range(BATCH_SIZE)])
-
-        def build_addr_alu_ops(b, batch_idx):
-            """Build ALU ops for address computation (can run during valu)"""
-            g_consts = batch_g_consts[batch_idx]
-            ops_list = []
-            for alu_batch in range(0, BATCH_SIZE, 6):
-                ops = []
-                for g in range(alu_batch, min(alu_batch + 6, BATCH_SIZE)):
-                    ops.append(("alu", ("+", b['addr_idx'][g], self.scratch["inp_indices_p"], g_consts[g])))
-                    ops.append(("alu", ("+", b['addr_val'][g], self.scratch["inp_values_p"], g_consts[g])))
-                ops_list.append(ops)
-            return ops_list
-
-        def build_vload_ops(b):
-            """Build vload ops (uses load slots, conflicts with gather)"""
-            ops_list = []
-            for g in range(BATCH_SIZE):
-                ops_list.append([
-                    ("load", ("vload", b['idx'][g], b['addr_idx'][g])),
-                    ("load", ("vload", b['val'][g], b['addr_val'][g])),
-                ])
-            return ops_list
-
-        def build_ga_alu_ops(b):
-            """Build ALU ops for gather address computation (can run during valu)"""
+        def build_ga_alu_ops_persistent(work, batch_idx):
+            """Build ALU ops for gather addresses using persistent idx"""
+            base_g = batch_idx * BATCH_SIZE
             ops_queue = []
             for g in range(BATCH_SIZE):
+                p_idx = get_persistent_idx(base_g + g)
                 for i in range(VLEN):
-                    ops_queue.append(("alu", ("+", b['ga'][g][i], self.scratch["forest_values_p"], b['idx'][g] + i)))
+                    ops_queue.append(("alu", ("+", work['ga'][g][i], self.scratch["forest_values_p"], p_idx + i)))
             ops_list = []
             for i in range(0, len(ops_queue), 12):
                 ops_list.append(ops_queue[i:i+12])
             return ops_list
 
-        def emit_load_phase_sequential(b, batch_idx):
-            """Emit address computation and vload with careful dependency handling"""
-            addr_ops = build_addr_alu_ops(b, batch_idx)  # 2 cycles: g0-5, g6-7
-            vload_ops = build_vload_ops(b)               # 8 cycles: g0, g1, ..., g7
+        # ============================================================
+        # INITIAL LOAD: Load all idx/val into persistent scratch (once!)
+        # ============================================================
+        # Overlap address computation with vloads
+        addr_ops = []
+        for g_start in range(0, n_groups_total, 6):
+            g_end = min(g_start + 6, n_groups_total)
+            ops = []
+            for g in range(g_start, g_end):
+                ops.append(("alu", ("+", addr_idx_base[g], self.scratch["inp_indices_p"], all_g_consts[g])))
+                ops.append(("alu", ("+", addr_val_base[g], self.scratch["inp_values_p"], all_g_consts[g])))
+            addr_ops.append(ops)
 
-            # Cycle 1: addr g0-5 (no vload - addr not ready)
-            self.instrs.append(self.build_vliw(addr_ops[0]))
-            # Cycle 2: addr g6-7 + vload g0 (g0 addr computed in cycle 1)
-            if len(addr_ops) > 1:
-                self.instrs.append(self.build_vliw(addr_ops[1] + vload_ops[0]))
-            else:
-                self.instrs.append(self.build_vliw(vload_ops[0]))
-            # Cycles 3-9: vload g1-g7 (g1-5 addr ready from cycle 1, g6-7 ready from cycle 2)
-            for ops in vload_ops[1:]:
-                self.instrs.append(self.build_vliw(ops))
+        vload_ops = []
+        for g in range(n_groups_total):
+            vload_ops.append([
+                ("load", ("vload", persistent_idx[g], addr_idx_base[g])),
+                ("load", ("vload", persistent_val[g], addr_val_base[g])),
+            ])
 
-            ga_ops = build_ga_alu_ops(b)
-            for ops in ga_ops:
-                self.instrs.append(self.build_vliw(ops))
+        # Cycle 1: compute first batch of addresses (groups 0-5)
+        self.instrs.append(self.build_vliw(addr_ops[0]))
 
-        def emit_store_phase(b):
-            """Emit store instructions for a batch"""
-            for g in range(BATCH_SIZE):
+        # Cycles 2+: vload groups whose addresses are ready || compute remaining addresses
+        vload_idx = 0
+        addr_idx = 1
+        while vload_idx < len(vload_ops):
+            bundle = list(vload_ops[vload_idx])
+            vload_idx += 1
+            if addr_idx < len(addr_ops):
+                bundle.extend(addr_ops[addr_idx])
+                addr_idx += 1
+            self.instrs.append(self.build_vliw(bundle))
+
+        # ============================================================
+        # MAIN LOOP: Process all rounds using persistent scratch
+        # ============================================================
+        for round_idx in range(rounds):
+            w0 = work_buf[0]
+            w1 = work_buf[1]
+
+            # ============================================================
+            # ROUND 0 SPECIAL CASE: All p_idx = 0, so ALL gathers load forest_values[0]
+            # Instead of gather, broadcast forest_values[0] to all work['node']!
+            # ============================================================
+            if round_idx == 0:
+                # Load forest_values[0] once (1 load cycle)
+                shared_node_val = self.alloc_scratch("shared_node_val")
                 self.instrs.append(self.build_vliw([
-                    ("store", ("vstore", b['addr_idx'][g], b['idx'][g])),
-                    ("store", ("vstore", b['addr_val'][g], b['val'][g])),
+                    ("load", ("load", shared_node_val, self.scratch["forest_values_p"]))
                 ]))
 
-        def build_store_ops(b):
-            """Build store ops, 2 vstores per cycle = 8 cycles for 8 groups"""
-            ops_list = []
-            for g in range(BATCH_SIZE):
-                ops_list.append([
-                    ("store", ("vstore", b['addr_idx'][g], b['idx'][g])),
-                    ("store", ("vstore", b['addr_val'][g], b['val'][g])),
-                ])
-            return ops_list
+                # Broadcast to all work['node'] positions (16 vbroadcasts / 6 per cycle = 3 cycles)
+                vbroadcast_ops = []
+                for g in range(BATCH_SIZE):
+                    vbroadcast_ops.append(("valu", ("vbroadcast", w0['node'][g], shared_node_val)))
+                    vbroadcast_ops.append(("valu", ("vbroadcast", w1['node'][g], shared_node_val)))
+                for i in range(0, len(vbroadcast_ops), 6):
+                    self.instrs.append(self.build_vliw(vbroadcast_ops[i:i+6]))
 
-        # CROSS-ROUND PIPELINING: Use round-offset buffer indexing
-        # 4 buffers for 4 batches: (i-2)%4 ≠ (i+1)%4 always (diff=3)
-        # This enables overlapping addr_ALU[i+1] with store[i-2] in steady state!
-        def get_buf(batch_idx, round_idx):
-            return buf[(batch_idx + round_idx) % 4]
+                # Run valu[0,1,2,3] with overlapped ga_ALU for next round
+                # Optimization: valu[0] is standalone, but valu[1] can overlap with ga_ALU[0,R+1]!
+                # After valu[0] completes, p_idx[batch0] is updated, so ga_ALU[0,R+1] can start.
+                valu_ops_0 = build_valu_ops_persistent(w0, 0)
+                for ops in valu_ops_0:
+                    self.instrs.append(self.build_vliw(ops))
 
-        for round_idx in range(rounds):
-            buf_0 = get_buf(0, round_idx)
-            buf_1 = get_buf(1, round_idx)
-            buf_2 = get_buf(2, round_idx)
-
-            if round_idx == 0:
-                # First round: full prologue for batch 0
-                emit_load_phase_sequential(buf_0, 0)
-            # else: addr[0] + vload[0] + ga_ALU[0] + addr[1] + vload[1] all done in prev epilogue
-
-            # gather[0] + addr_ALU[1] (round 0) OR gather[0] + ga_ALU[1] (rounds > 0)
-            gather_ops_0 = build_gather_ops(buf_0)
-            if round_idx == 0:
-                addr_ops_1 = build_addr_alu_ops(buf_1, 1)
-                for i, cycle_ops in enumerate(gather_ops_0):
-                    bundle = list(cycle_ops)
-                    if i < len(addr_ops_1):
-                        bundle.extend(addr_ops_1[i])
-                    self.instrs.append(self.build_vliw(bundle))
-            else:
-                # Overlap ga_ALU[1] with gather[0] (vload[1] done in epilogue, ga needs those indices)
-                ga_ops_1 = build_ga_alu_ops(buf_1)
-                ga1_idx = 0
-                for cycle_ops in gather_ops_0:
-                    bundle = list(cycle_ops)
-                    if ga1_idx < len(ga_ops_1):
-                        bundle.extend(ga_ops_1[ga1_idx])
-                        ga1_idx += 1
+                # valu[1] || ga_ALU[0,R+1] (p_idx[batch0] ready after valu[0])
+                valu_ops_1 = build_valu_ops_persistent(w1, 1)
+                next_ga_ops_0 = build_ga_alu_ops_persistent(w0, 0)
+                v_idx, a_idx = 0, 0
+                while v_idx < len(valu_ops_1):
+                    bundle = list(valu_ops_1[v_idx])
+                    v_idx += 1
+                    if a_idx < len(next_ga_ops_0):
+                        bundle.extend(next_ga_ops_0[a_idx])
+                        a_idx += 1
                     self.instrs.append(self.build_vliw(bundle))
 
-            # Prologue 2: vload[1] and ga_ALU[1] (only for round 0)
-            if round_idx == 0:
-                # Round 0: do both vload[1] and ga_ALU[1]
-                vload_ops_1 = build_vload_ops(buf_1)
-                for ops in vload_ops_1:
-                    self.instrs.append(self.build_vliw(ops))
-                ga_ops_1 = build_ga_alu_ops(buf_1)
-                for ops in ga_ops_1:
-                    self.instrs.append(self.build_vliw(ops))
-            # else: vload[1] done in epilogue, ga_ALU[1] overlapped with gather[0] above
+                # valu[2] || gather[0,R+1] || ga_ALU[1,R+1] (addresses ready from valu[1] phase!)
+                valu_ops_2 = build_valu_ops_persistent(w0, 2)
+                next_gather_ops_0 = build_gather_ops_persistent(w0, 0)
+                next_ga_ops_1 = build_ga_alu_ops_persistent(w1, 1)
+                v_idx, g_idx, a_idx = 0, 0, 0
+                while v_idx < len(valu_ops_2) or g_idx < len(next_gather_ops_0):
+                    bundle = []
+                    if v_idx < len(valu_ops_2):
+                        bundle.extend(valu_ops_2[v_idx])
+                        v_idx += 1
+                    if g_idx < len(next_gather_ops_0):
+                        bundle.extend(next_gather_ops_0[g_idx])
+                        g_idx += 1
+                    if a_idx < len(next_ga_ops_1):
+                        bundle.extend(next_ga_ops_1[a_idx])
+                        a_idx += 1
+                    self.instrs.append(self.build_vliw(bundle))
 
-            # gather[1] + valu[0] + early addr_ALU[2]
-            gather_ops_1 = build_gather_ops(buf_1)
-            valu_ops_0 = build_valu_ops(buf_0)
-            addr_ops_2 = build_addr_alu_ops(buf_2, 2)
+                # valu[3] || gather[1,R+1] || ga_ALU[2,R+1]
+                # (gather[0] done during valu[2], p_idx[batch1] ready after valu[1])
+                valu_ops_3 = build_valu_ops_persistent(w1, 3)
+                next_gather_ops_1 = build_gather_ops_persistent(w1, 1)
+                next_ga_ops_2 = build_ga_alu_ops_persistent(w0, 2)
+                v_idx, g_idx, a_idx = 0, 0, 0
+                while v_idx < len(valu_ops_3) or g_idx < len(next_gather_ops_1):
+                    bundle = []
+                    if v_idx < len(valu_ops_3):
+                        bundle.extend(valu_ops_3[v_idx])
+                        v_idx += 1
+                    if g_idx < len(next_gather_ops_1):
+                        bundle.extend(next_gather_ops_1[g_idx])
+                        g_idx += 1
+                    if a_idx < len(next_ga_ops_2):
+                        bundle.extend(next_ga_ops_2[a_idx])
+                        a_idx += 1
+                    self.instrs.append(self.build_vliw(bundle))
+
+                continue  # Skip normal batch processing for round 0
+
+            # ============================================================
+            # ROUNDS 1+: Normal processing with gather/valu overlap
+            # ============================================================
+            # From previous epilogue: gather[0,1] done, ga_ALU[2] done
+            # So we have node[0], node[1] ready, and ga[2] addresses ready
+
+            # Batch 0: gather[2] || valu[0] || ga_ALU[3]
+            gather_ops_2 = build_gather_ops_persistent(w0, 2)
+            valu_ops_0 = build_valu_ops_persistent(w0, 0)
+            ga_ops_3 = build_ga_alu_ops_persistent(w1, 3)
             g_idx, v_idx, a_idx = 0, 0, 0
-            while g_idx < len(gather_ops_1) or v_idx < len(valu_ops_0):
+            while g_idx < len(gather_ops_2) or v_idx < len(valu_ops_0):
                 bundle = []
-                if g_idx < len(gather_ops_1):
-                    bundle.extend(gather_ops_1[g_idx])
+                if g_idx < len(gather_ops_2):
+                    bundle.extend(gather_ops_2[g_idx])
                     g_idx += 1
                 if v_idx < len(valu_ops_0):
                     bundle.extend(valu_ops_0[v_idx])
                     v_idx += 1
-                if a_idx < len(addr_ops_2):
-                    bundle.extend(addr_ops_2[a_idx])
+                if a_idx < len(ga_ops_3):
+                    bundle.extend(ga_ops_3[a_idx])
                     a_idx += 1
                 self.instrs.append(self.build_vliw(bundle))
 
-            # Steady state: batches 2, 3, ...
-            for batch_idx in range(2, n_batches):
-                cur_buf = get_buf(batch_idx, round_idx)
-                prev_buf = get_buf(batch_idx - 1, round_idx)
-                prev_prev_buf = get_buf(batch_idx - 2, round_idx)
+            # Batch 1: gather[3] || valu[1] || ga_ALU[0,next]
+            gather_ops_3 = build_gather_ops_persistent(w1, 3)
+            valu_ops_1 = build_valu_ops_persistent(w1, 1)
+            if round_idx < rounds - 1:
+                ga_ops_0_next = build_ga_alu_ops_persistent(w0, 0)
+            else:
+                ga_ops_0_next = []
+            g_idx, v_idx, a_idx = 0, 0, 0
+            while g_idx < len(gather_ops_3) or v_idx < len(valu_ops_1):
+                bundle = []
+                if g_idx < len(gather_ops_3):
+                    bundle.extend(gather_ops_3[g_idx])
+                    g_idx += 1
+                if v_idx < len(valu_ops_1):
+                    bundle.extend(valu_ops_1[v_idx])
+                    v_idx += 1
+                if a_idx < len(ga_ops_0_next):
+                    bundle.extend(ga_ops_0_next[a_idx])
+                    a_idx += 1
+                self.instrs.append(self.build_vliw(bundle))
 
-                # addr_ALU[2] was done in prologue 2's gather+valu phase
-                # For batch 3+, overlap addr_ALU with valu (ALU vs VALU slots, different buffers)
-                vload_ops = build_vload_ops(cur_buf)
-                valu_ops = build_valu_ops(prev_buf)
-                v_idx = 0
-
-                # addr_ALU[i] was done in previous batch's gather phase (or prologue for batch 2)
-                # Just do vload + valu
-                for vl_ops in vload_ops:
-                    bundle = list(vl_ops)
-                    if v_idx < len(valu_ops):
-                        bundle.extend(valu_ops[v_idx])
-                        v_idx += 1
-                    self.instrs.append(self.build_vliw(bundle))
-
-                # Phase 2: ga_ALU[i] + valu[i-1] continuing - 6 cycles
-                ga_ops = build_ga_alu_ops(cur_buf)
-                for ga_cycle in ga_ops:
-                    bundle = list(ga_cycle)
-                    if v_idx < len(valu_ops):
-                        bundle.extend(valu_ops[v_idx])
-                        v_idx += 1
-                    self.instrs.append(self.build_vliw(bundle))
-
-                # Phase 3: gather[i] + valu[i-1] remaining + store[i-2] + addr_ALU[i+1]
-                gather_ops = build_gather_ops(cur_buf)
-                store_ops = build_store_ops(prev_prev_buf)
-                # Overlap addr_ALU for NEXT batch during this gather phase
-                next_addr_ops = []
-                if batch_idx + 1 < n_batches:
-                    next_buf = get_buf(batch_idx + 1, round_idx)
-                    next_addr_ops = build_addr_alu_ops(next_buf, batch_idx + 1)
-                g_idx, s_idx, a_idx = 0, 0, 0
-                while g_idx < len(gather_ops) or v_idx < len(valu_ops) or s_idx < len(store_ops):
+            # Batch 2: valu[2] || gather[0,next] || ga_ALU[1,next]
+            valu_ops_2 = build_valu_ops_persistent(w0, 2)
+            if round_idx < rounds - 1:
+                next_gather_ops_0 = build_gather_ops_persistent(w0, 0)
+                next_ga_ops_1 = build_ga_alu_ops_persistent(w1, 1)
+                v_idx, g_idx, a_idx = 0, 0, 0
+                while v_idx < len(valu_ops_2) or g_idx < len(next_gather_ops_0):
                     bundle = []
-                    if g_idx < len(gather_ops):
-                        bundle.extend(gather_ops[g_idx])
-                        g_idx += 1
-                    if v_idx < len(valu_ops):
-                        bundle.extend(valu_ops[v_idx])
+                    if v_idx < len(valu_ops_2):
+                        bundle.extend(valu_ops_2[v_idx])
                         v_idx += 1
-                    if s_idx < len(store_ops):
-                        bundle.extend(store_ops[s_idx])
-                        s_idx += 1
-                    if a_idx < len(next_addr_ops):
-                        bundle.extend(next_addr_ops[a_idx])
+                    if g_idx < len(next_gather_ops_0):
+                        bundle.extend(next_gather_ops_0[g_idx])
+                        g_idx += 1
+                    if a_idx < len(next_ga_ops_1):
+                        bundle.extend(next_ga_ops_1[a_idx])
                         a_idx += 1
                     self.instrs.append(self.build_vliw(bundle))
-
-            # Epilogue 1: valu[n_batches-1] + store[n_batches-2]
-            last_buf = get_buf(n_batches - 1, round_idx)
-            second_last_buf = get_buf(n_batches - 2, round_idx)
-            valu_ops = build_valu_ops(last_buf)
-            store_ops = build_store_ops(second_last_buf)
-            v_idx, s_idx = 0, 0
-            while v_idx < len(valu_ops) or s_idx < len(store_ops):
-                bundle = []
-                if v_idx < len(valu_ops):
-                    bundle.extend(valu_ops[v_idx])
-                    v_idx += 1
-                if s_idx < len(store_ops):
-                    bundle.extend(store_ops[s_idx])
-                    s_idx += 1
-                self.instrs.append(self.build_vliw(bundle))
-
-            # Epilogue 2: store[last] + overlap with next round's start
-            store_ops = build_store_ops(last_buf)
-            if round_idx < rounds - 1:
-                # Cross-round overlap: store uses buf[(3+R)%3], next round uses buf[(R+1)%3]
-                next_buf_0 = get_buf(0, round_idx + 1)
-                next_buf_1 = get_buf(1, round_idx + 1)
-                next_addr_ops_0 = build_addr_alu_ops(next_buf_0, 0)
-                next_addr_ops_1 = build_addr_alu_ops(next_buf_1, 1)
-                next_vload_ops_0 = build_vload_ops(next_buf_0)
-                next_vload_ops_1 = build_vload_ops(next_buf_1)
-                next_ga_ops_0 = build_ga_alu_ops(next_buf_0)
-
-                # Cycles 1-2: store + addr[0] + vload[0] starts
-                bundle = list(store_ops[0]) + list(next_addr_ops_0[0])
-                self.instrs.append(self.build_vliw(bundle))
-                bundle = list(store_ops[1]) + list(next_addr_ops_0[1]) + list(next_vload_ops_0[0])
-                self.instrs.append(self.build_vliw(bundle))
-                # Cycles 3-8: store + vload[0] + addr[1]
-                a1_idx = 0
-                for i in range(2, 8):
-                    bundle = list(store_ops[i]) + list(next_vload_ops_0[i - 1])
-                    if a1_idx < len(next_addr_ops_1):
-                        bundle.extend(next_addr_ops_1[a1_idx])
-                        a1_idx += 1
-                    self.instrs.append(self.build_vliw(bundle))
-                # Cycle 9: vload[0, g7]
-                self.instrs.append(self.build_vliw(next_vload_ops_0[7]))
-                # Cycles 10-17: ga_ALU[0] + vload[1] (overlapped: ALU vs load!)
-                ga0_idx = 0
-                for vl_idx, vl_ops in enumerate(next_vload_ops_1):
-                    bundle = list(vl_ops)
-                    if ga0_idx < len(next_ga_ops_0):
-                        bundle.extend(next_ga_ops_0[ga0_idx])
-                        ga0_idx += 1
-                    self.instrs.append(self.build_vliw(bundle))
-                # Remaining ga_ALU[0] if any (shouldn't be, vload=8, ga=6)
-                while ga0_idx < len(next_ga_ops_0):
-                    self.instrs.append(self.build_vliw(next_ga_ops_0[ga0_idx]))
-                    ga0_idx += 1
-                # ga_ALU[1] will be overlapped with gather[0] in round start
             else:
-                # Last round - just store
-                for cycle_ops in store_ops:
-                    self.instrs.append(self.build_vliw(cycle_ops))
+                # Last round - no next round operations
+                for ops in valu_ops_2:
+                    self.instrs.append(self.build_vliw(ops))
+
+            # Epilogue: valu[3] || gather[1,next] || ga_ALU[2,next]
+            valu_ops_3 = build_valu_ops_persistent(w1, 3)
+            if round_idx < rounds - 1:
+                next_gather_ops_1 = build_gather_ops_persistent(w1, 1)
+                next_ga_ops_2 = build_ga_alu_ops_persistent(w0, 2)
+
+                v_idx, g_idx, a_idx = 0, 0, 0
+                while v_idx < len(valu_ops_3) or g_idx < len(next_gather_ops_1):
+                    bundle = []
+                    if v_idx < len(valu_ops_3):
+                        bundle.extend(valu_ops_3[v_idx])
+                        v_idx += 1
+                    if g_idx < len(next_gather_ops_1):
+                        bundle.extend(next_gather_ops_1[g_idx])
+                        g_idx += 1
+                    if a_idx < len(next_ga_ops_2):
+                        bundle.extend(next_ga_ops_2[a_idx])
+                        a_idx += 1
+                    self.instrs.append(self.build_vliw(bundle))
+            else:
+                # LAST ROUND OPTIMIZATION: overlap valu[3] with vstores!
+                # valu uses VALU slots, vstore uses STORE slots - no conflict!
+                # Groups 0-23 are done (valu[0,1,2] completed), can vstore them now
+                vstore_ops_0_23 = []
+                for g in range(24):
+                    vstore_ops_0_23.append([
+                        ("store", ("vstore", addr_idx_base[g], persistent_idx[g])),
+                        ("store", ("vstore", addr_val_base[g], persistent_val[g])),
+                    ])
+
+                v_idx, s_idx = 0, 0
+                while v_idx < len(valu_ops_3):
+                    bundle = list(valu_ops_3[v_idx])
+                    v_idx += 1
+                    if s_idx < len(vstore_ops_0_23):
+                        bundle.extend(vstore_ops_0_23[s_idx])
+                        s_idx += 1
+                    self.instrs.append(self.build_vliw(bundle))
+
+                # Remaining vstores for groups 24-31 (just updated by valu[3])
+                for g in range(24, n_groups_total):
+                    self.instrs.append(self.build_vliw([
+                        ("store", ("vstore", addr_idx_base[g], persistent_idx[g])),
+                        ("store", ("vstore", addr_val_base[g], persistent_val[g])),
+                    ]))
+
+        # Skip separate final vstore - already done in last round optimization
 
         self.instrs.append({"flow": [("pause",)]})
 
